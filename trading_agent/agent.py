@@ -5,7 +5,6 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
-import anthropic
 from alpaca.data import NewsClient, StockHistoricalDataClient
 from alpaca.data.requests import NewsRequest, StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
@@ -24,10 +23,59 @@ class TradingAgent:
     def __init__(self):
         key = os.environ["ALPACA_API_KEY"]
         secret = os.environ["ALPACA_SECRET_KEY"]
-        self.claude = anthropic.Anthropic()
+        self._init_llm()
         self.trading = TradingClient(key, secret, paper=True)
         self.market_data = StockHistoricalDataClient(key, secret)
         self.news_client = NewsClient(api_key=key, secret_key=secret)
+
+    def _init_llm(self):
+        """Configure the LLM backend from env vars.
+
+        LLM_PROVIDER=anthropic (default) uses the Anthropic API.
+        LLM_PROVIDER=local uses any OpenAI-compatible server, e.g.:
+          - Ollama:    LLM_BASE_URL=http://localhost:11434/v1  LLM_MODEL=llama3.1
+          - LM Studio: LLM_BASE_URL=http://localhost:1234/v1   LLM_MODEL=<loaded model>
+          - llama.cpp: LLM_BASE_URL=http://localhost:8080/v1
+          - vLLM:      LLM_BASE_URL=http://localhost:8000/v1
+        """
+        self.provider = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+        if self.provider == "anthropic":
+            import anthropic
+            self.llm = anthropic.Anthropic()
+            self.model = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
+        else:
+            from openai import OpenAI
+            base_url = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
+            api_key = os.environ.get("LLM_API_KEY", "not-needed")
+            self.llm = OpenAI(base_url=base_url, api_key=api_key)
+            self.model = os.environ.get("LLM_MODEL", "llama3.1")
+        print(f"LLM backend: {self.provider} (model: {self.model})", flush=True)
+
+    def _chat(self, prompt: str) -> str:
+        """Send a single-turn prompt to the configured LLM and return text."""
+        if self.provider == "anthropic":
+            resp = self.llm.messages.create(
+                model=self.model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.content[0].text
+
+        # OpenAI-compatible local server. response_format nudges JSON-capable
+        # servers (Ollama, vLLM) to emit valid JSON; ignored by those that
+        # don't support it.
+        kwargs = {
+            "model": self.model,
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = self.llm.chat.completions.create(
+                response_format={"type": "json_object"}, **kwargs
+            )
+        except Exception:
+            resp = self.llm.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content
 
     def get_market_data(self, symbol: str) -> dict:
         now = datetime.now(timezone.utc)
@@ -86,7 +134,7 @@ class TradingAgent:
             ],
         }
 
-    def ask_claude(self, symbol: str, market_data: dict, news: list[str], portfolio: dict) -> dict:
+    def ask_llm(self, symbol: str, market_data: dict, news: list[str], portfolio: dict) -> dict:
         position = next((p for p in portfolio["positions"] if p["symbol"] == symbol), None)
         position_str = (
             f"{position['qty']} shares @ avg ${position['avg_cost']} "
@@ -95,7 +143,7 @@ class TradingAgent:
             else "None"
         )
 
-        prompt = f"""You are an AI stock trading analyst for a paper trading account (no real money at risk).
+        prompt = f"""You are an AI stock trading analyst for a paper trading account (no real money at risk). Think only about the data given; do not invent facts.
 
 ## {symbol} Market Data
 - Latest price: ${market_data['latest_price']}
@@ -123,15 +171,19 @@ Respond ONLY with valid JSON (no markdown):
   "reasoning": "<2-3 sentence explanation referencing the data>"
 }}"""
 
-        response = self.claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text
+        text = self._chat(prompt)
         start = text.find("{")
         end = text.rfind("}") + 1
-        return json.loads(text[start:end])
+        try:
+            return json.loads(text[start:end])
+        except (json.JSONDecodeError, ValueError):
+            # Small local models occasionally return malformed JSON; fail safe.
+            return {
+                "action": "HOLD",
+                "amount_usd": None,
+                "confidence": "LOW",
+                "reasoning": f"Could not parse model response, defaulting to HOLD. Raw: {text[:120]}",
+            }
 
     def execute_decision(self, symbol: str, decision: dict, market_data: dict, portfolio: dict) -> dict | None:
         action = decision["action"]
@@ -164,7 +216,7 @@ Respond ONLY with valid JSON (no markdown):
         portfolio = self.get_portfolio()
         market_data = self.get_market_data(symbol)
         news = self.get_news(symbol)
-        decision = self.ask_claude(symbol, market_data, news, portfolio)
+        decision = self.ask_llm(symbol, market_data, news, portfolio)
 
         order = None
         if decision["action"] != "HOLD":

@@ -1,5 +1,11 @@
-anthropic>=0.40.0
+# Alpaca paper trading + dashboard server (always required)
 alpaca-py>=0.30.0
 flask>=3.0.0
 flask-cors>=5.0.0
 python-dotenv>=1.0.0
+
+# LLM backends — install the one matching your LLM_PROVIDER:
+#   anthropic (cloud, default)  -> anthropic
+#   local (Ollama/LM Studio/...) -> openai
+anthropic>=0.40.0
+openai>=1.0.0
