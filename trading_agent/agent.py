@@ -48,7 +48,7 @@ class TradingAgent:
             base_url = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
             api_key = os.environ.get("LLM_API_KEY", "not-needed")
             self.llm = OpenAI(base_url=base_url, api_key=api_key)
-            self.model = os.environ.get("LLM_MODEL", "llama3.1")
+            self.model = os.environ.get("LLM_MODEL", "qwen2.5:3b")
         print(f"LLM backend: {self.provider} (model: {self.model})", flush=True)
 
     def _chat(self, prompt: str) -> str:
